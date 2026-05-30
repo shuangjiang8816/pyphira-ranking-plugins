@@ -1,5 +1,5 @@
 # plugins/my_plugin.py
-from utils.room import rooms
+import utils.room as room
 from rymc.phira.protocol.data.message import ChatMessage
 from rymc.phira.protocol.packet.clientbound import ClientBoundMessagePacket
 
@@ -7,30 +7,36 @@ import requests
 
 PLUGIN_INFO = {
     "name": "panking",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "description":"新增排行榜功能",
 }
 
 player_url = "https://phira.5wyxi.com/user/"
 store_url = "https://phira.5wyxi.com/record/"
 player_list = []
-rooms_values = rooms.values()
+
+# 全局变量，存储不同房间的状态
+room_dict:dict = {}
 
 def setup(ctx):
-    def broadcast_to_all(message,rooms_values):
-        """向所有在线玩家广播消息"""
+    def on_auth_success(connection=None, **_):
+        connection.send(ClientBoundMessagePacket(ChatMessage(-1, "欢迎游玩phira!(服务端已修改,排行榜插件by:霜降awa)")))
+
+    def broadcast_to_all(message,rooms_id):
+        """向房间内玩家广播消息"""
         packet = ClientBoundMessagePacket(ChatMessage(-1, message))
         
         # 遍历所有房间的所有玩家
-        for room in rooms_values:
-            for room_user in room.users.values():
-                try:
-                    room_user.connection.send(packet)
-                except Exception as e:
-                    ctx.logger.error(f"广播失败: {e}")
+        for user in room_dict[rooms_id].users.values():
+            try:
+                user.connection.send(packet)
+            except Exception as e:
+                ctx.logger.error(f"广播失败: {e}")
 
     def ranking(player_list:list) -> str:
+        """排名逻辑"""
         def format(ranking_list:list) -> str:
+            """格式化"""
             ranking_message:str = ""
             for i in range(0,len(ranking_list)):
                 name = ranking_list[i]['name']
@@ -45,43 +51,60 @@ def setup(ctx):
         ranking_list:list = sorted(player_list,key=get_score,reverse=True)
         return format(ranking_list)
 
-    def on_chat(packet=None, **_):
-        # packet 是 ServerBoundChatPacket
+    def to_ranking(packet=None,handler=None, **_):
+        """排名主函数"""
         # 解析出游玩id
         play_id = packet.id
         # 请求本次游玩数据
         return_message= requests.get(f"{store_url}{play_id}")
         player_information = return_message.json()
+        player_id = player_information['player']
         score = player_information['score']
         accuracy = player_information['accuracy']
         # 获取玩家名称
-        player = requests.get(f"{player_url}{player_information['player']}")
+        player = requests.get(f"{player_url}{player_id}")
         name = player.json()['name']
+        # 获取房间id 
+        room_id = room.get_roomId(player_id)['roomId']
         # 整理成字典并保存
         player_dict = {"name":name,"score":score,"accuracy":accuracy}
-        player_list.append(player_dict)
-        # 排序并格式化
-        # 广播
-        result = ranking(player_list)
-        broadcast_to_all(ranking(player_list),rooms_values)
-        ctx.logger.debug(result)
+        room_dict[room_id].player_list.append(player_dict)
+        room_dict[room_id].finish.add(player_id)
+        # 检查是否所有玩家完成游戏
+        if len(room_dict[room_id].users) == len(room_dict[room_id].finish):
+            # 排序并广播
+            result = ranking(room_dict[room_id].player_list)
+            broadcast_to_all(result,room_id)
+            room_dict[room_id].player_list.clear()# 清除列表信息
 
-    def clear(packet=None, **_):
-        # 先保存房间
-        global player_list,rooms_values
-        rooms_values = rooms.values()
-        player_list = []
+    def save_room(handler=None, **_):
+        """复制并追加房间信息"""
+        user_id = handler.user_info.id
+        ctx.logger.debug(room.get_roomId(user_id))
+        # 防止获取失败，重试3次
+        for _ in range(0,3):
+            result = room.get_roomId(user_id)
+            if result['status'] == "0":
+                room_id = result['roomId']
+                room_dict[room_id] = room.rooms[room_id] # 复制房间信息
+                room_dict[room_id].player_list = []      # 追加一个列表，用于储存游玩结束的玩家的游玩信息
+                room_dict[room_id].finish = set()        # 更改finished字典为空集合
+                ctx.logger.debug("成功复制房间信息")
+                break
+            else:
+                ctx.logger.debug("玩家不在房间内！")
+                pass
+        # room_list.append(Room(rooms))
 
     def printing1(packet=None,**kwargs):
-        ctx.logger.debug(packet)
-
-    def on_auth_success(connection=None, **_):
-        connection.send(ClientBoundMessagePacket(ChatMessage(-1, "欢迎游玩phira!(服务端已修改,排行榜插件by:霜降awa)")))
+        """调试用"""
+        if not "ServerBoundPingPacket" in str(type(packet)):# 过滤心跳包
+            ctx.logger.debug(packet)
 
     # ctx.on("packet.received", printing1)
     ctx.on("auth.success", on_auth_success)
-    ctx.on("packet.ServerBoundPlayedPacket.received", on_chat)
-    ctx.on("packet.ServerBoundSelectChartPacket.received",clear)
+    ctx.on('handler.handleRequestStart.after',save_room)
+    ctx.on("handler.handlePlayed.after", to_ranking)
 
     # 可选：返回 teardown，用于卸载/重载前清理资源
     def teardown():
